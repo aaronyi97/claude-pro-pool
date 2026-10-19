@@ -61,7 +61,8 @@ if name == "claude-swap":
         policy = read(home / "fake-policy.json", {})
         for n, a in seq["accounts"].items():
             p = policy.get(n, {})
-            rows.append(dict(number=int(n), alias=a["alias"], active=int(n) == active,
+            rows.append(dict(number=int(n), email=a["email"], organizationUuid=a.get("organizationUuid", ""),
+                             alias=a["alias"], active=int(n) == active,
                              disabled=a.get("disabled", False), usageStatus=p.get("usageStatus", "ok"),
                              usage={"fiveHour": {"pct": p.get("h5", 10)},
                                     "sevenDay": {"pct": p.get("d7", 10), "resetsAt": p.get("reset", f"2030-01-{int(n):02d}T00:00:00Z")}}))
@@ -81,6 +82,8 @@ if name == "claude-swap":
         profile.mkdir(parents=True, exist_ok=True)
         if not (profile / ".claude.json").exists():
             write(profile / ".claude.json", {"synthetic": True})
+        write(profile / ".fake-login", {"loggedIn": True, "email": seq["accounts"][n]["email"],
+                                        "orgId": seq["accounts"][n].get("organizationUuid", "")})
         env = dict(os.environ, CLAUDE_CONFIG_DIR=str(profile), FAKE_ACCOUNT=n)
         os.execvpe("claude", ["claude", *args[args.index("--") + 1:]], env)
     elif args[0] in {"disable", "enable"}:

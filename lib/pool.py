@@ -443,7 +443,9 @@ def doctor():
     except (OSError, subprocess.SubprocessError):
         check(False, "claude-swap 无法运行", "重新运行安装命令")
     rule = CONFIG / "CLAUDE.md"
-    check(rule.exists() and "claude-pro-pool:rules:BEGIN" in rule.read_text(), "主对话规则块", "重新运行安装命令")
+    rule_text = rule.read_text() if rule.exists() else ""
+    check(rule_text.count("claude-pro-pool:rules:BEGIN") == 1 and rule_text.count("claude-pro-pool:rules:END") == 1,
+          "主对话规则块", "重新运行安装命令")
     check((CONFIG / "skills/claude-pro-pool/SKILL.md").is_file(), "派单 skill", "重新运行安装命令")
     check(PLIST.exists() and service_loaded(), "同步服务已加载", "在 GUI 登录会话中运行 claude-pro-pool sync-service")
     sync_state = read_json(STATE / "sync-status.json", {})
@@ -457,10 +459,20 @@ def doctor():
         d = runpy.run_path(str(SOURCE / "bin/dispatch-claude"), run_name="pool_dispatch")
         rows = d["evaluate"](data, d["caller_account"](data.get("activeAccountNumber")))
         for a, row in zip(accounts, rows):
-            usage_ok = a.get("usageStatus") == "ok"
-            print(f"{'OK  ' if usage_ok else 'WARN'} acc{a['number']} 登录/额度={a.get('usageStatus')} "
+            usage_ok = a.get("usageStatus") == "ok" and row["h5"] is not None and row["d7"] is not None
+            login_ok = False
+            try:
+                profile = None if a.get("active") else row["dir"]
+                if not a.get("active") and not profile:
+                    raise RuntimeError("独立档案尚未初始化")
+                identity = auth_status(profile)
+                login_ok = (identity.get("email") == a.get("email") and
+                            (identity.get("orgId") or "") == (a.get("organizationUuid") or ""))
+            except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
+                pass
+            print(f"{'OK  ' if usage_ok and login_ok else 'WARN'} acc{a['number']} 登录={'正常' if login_ok else '未确认或身份不符'} 额度={a.get('usageStatus')} "
                   f"5h={row['h5']}% 7d={row['d7']}%：{'、'.join(row['why']) or '可派单'}")
-            if not usage_ok:
+            if not usage_ok or not login_ok:
                 issues += 1
                 print(f"     → claude-pro-pool reauth {a['number']}；条款问题需本人在 claude.ai 同意")
         check(bool(d["rank"](rows)), "有可自动派单账号", "增加其余账号；额度不足请等待重置，停用号可 enable")

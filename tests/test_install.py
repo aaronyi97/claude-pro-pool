@@ -52,6 +52,14 @@ class InstallTests(unittest.TestCase):
         output = self.s.manage("add-account", "--current", code=2)
         self.assertIn("未登录", output)
 
+    def test_committed_clone_installs_using_readme_command(self):
+        from support import ROOT
+        checkout = self.s.home / "checkout"
+        self.s.run(["git", "clone", "--no-hardlinks", ROOT, checkout])
+        self.assertIn("安装完成", self.s.run(["bash", "./install.sh"], cwd=checkout))
+        self.assertIn("还没有号", self.s.manage("doctor", code=1))
+        self.s.manage("uninstall")
+
     def test_duplicate_and_wrong_slot_do_not_overwrite(self):
         self.s.install()
         self.s.seed(2)
@@ -103,6 +111,7 @@ class RealInstallTests(unittest.TestCase):
             s.install()
             s.manage("uninstall")
             self.assertFalse((s.home / ".claude-pro-pool/deps").exists())
+            self.assertFalse((s.home / ".config/uv/uv-receipt.json").exists())
             print("REAL INSTALL: official uv + Python + claude-swap 0.26.0, doctor, synthetic enrollment, reinstall, uninstall PASS")
         finally:
             s.cleanup()

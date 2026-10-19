@@ -140,7 +140,7 @@ export CLAUDE_PRO_POOL_PERMISSION_MODE=acceptEdits
 
 **`doctor` 提示“还没有号”**：这是完成安装、尚未登记账号的正常中间状态。运行 `add-account --current` 和 `add-account`。`doctor` 有待处理项时退出码为 1，不会把未知额度说成正常。
 
-**有两个号却没有可派单号**：看 `accounts` 的逐号原因。主号被排除是预期行为；另一个号需有额度、无交互主对话，并完成独立档案初始化。向导会初始化；外部新增的号可先在正常终端运行 `claude-swap run N -- --version`，再 `sync`。本工具私有的上游命令位于 `~/.claude-pro-pool/deps/bin/claude-swap`。
+**有两个号却没有可派单号**：看 `accounts` 的逐号原因。主号被排除是预期行为；另一个号需有额度、无交互主对话，并完成独立档案初始化。向导会初始化；外部新增的号可先在正常终端运行 `~/.claude-pro-pool/runtime/bin/pool-swap run N -- --version`，再 `sync`。适配入口管理共享配置，原始上游命令位于 `~/.claude-pro-pool/deps/bin/claude-swap`。
 
 **某一个号反复失败**：先看 `status JOB` 每轮的 `auth/limit/unusable`，再对该号 `reauth N`。同一账号不要同时在多个目录或机器反复登录，以免刷新凭据互相干扰。其他号正常时无需重装整个号池。
 

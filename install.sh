@@ -28,7 +28,7 @@ if [ -z "$pool_uv" ]; then
   pool_uv="$pool_state/deps/uv/uv"
   if [ ! -x "$pool_uv" ]; then
     curl -fsSL https://astral.sh/uv/install.sh -o "$pool_stage/uv-install.sh"
-    UV_INSTALL_DIR="$pool_state/deps/uv" UV_NO_MODIFY_PATH=1 sh "$pool_stage/uv-install.sh"
+    UV_UNMANAGED_INSTALL="$pool_state/deps/uv" sh "$pool_stage/uv-install.sh"
   fi
 fi
 export UV_TOOL_DIR="$pool_state/deps/tools"

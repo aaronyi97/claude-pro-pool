@@ -57,3 +57,9 @@ class SyncTests(unittest.TestCase):
         self.assertIn("WARN 同步服务已加载", output)
         self.assertIn("reauth 2", output)
 
+    def test_doctor_detects_profile_identity_mismatch_even_with_cached_quota(self):
+        self.s.write(".claude-swap-backup/sessions/2-profile/.fake-login",
+                     {"loggedIn": True, "email": "wrong-identity", "orgId": ""})
+        output = self.s.manage("doctor", code=1)
+        self.assertIn("未确认或身份不符", output)
+

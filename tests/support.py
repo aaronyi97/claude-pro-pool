@@ -34,8 +34,8 @@ class Sandbox:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(obj))
 
-    def run(self, args, code=0, input=None, timeout=180):
-        result = subprocess.run([str(a) for a in args], env=self.env, cwd=ROOT, input=input,
+    def run(self, args, code=0, input=None, timeout=180, cwd=None):
+        result = subprocess.run([str(a) for a in args], env=self.env, cwd=cwd or ROOT, input=input,
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
         if result.returncode != code:
             raise AssertionError(f"command {args}: expected {code}, got {result.returncode}\n{result.stdout}")
