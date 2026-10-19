@@ -76,7 +76,7 @@ class InstallTests(unittest.TestCase):
         curl = self.s.bin / "curl"
         import shlex
         curl.write_text("#!/bin/sh\ncase \"$2\" in\n" +
-                        "https://github.com/3918109465-beep/claude-pro-pool/archive/refs/heads/main.tar.gz)\n" +
+                        "https://github.com/aaronyi97/claude-pro-pool/archive/refs/heads/main.tar.gz)\n" +
                         "cp " + shlex.quote(str(archive)) + ' "$4";;\n*) exit 9;;\nesac\n')
         curl.chmod(0o755)
         output = self.s.run(["bash"], input=(ROOT / "install.sh").read_text())

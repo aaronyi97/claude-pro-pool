@@ -18,7 +18,7 @@ if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
   pool_source="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
 if [ -z "$pool_source" ] || [ ! -f "$pool_source/lib/pool.py" ]; then
-  curl -fsSL https://github.com/3918109465-beep/claude-pro-pool/archive/refs/heads/main.tar.gz -o "$pool_stage/source.tar.gz"
+  curl -fsSL https://github.com/aaronyi97/claude-pro-pool/archive/refs/heads/main.tar.gz -o "$pool_stage/source.tar.gz"
   tar -xzf "$pool_stage/source.tar.gz" -C "$pool_stage"
   pool_source="$pool_stage/claude-pro-pool-main"
 fi

@@ -22,7 +22,7 @@ flowchart LR
 需要 **macOS、已安装的 [Claude Code CLI](https://code.claude.com/docs/en/setup)、至少两个本人的 Pro/Max 订阅**。首次下载 uv、Python 和依赖通常超过 30 秒，取决于网络。不需要预装 claude-swap、Python 或本项目的任何脚本。
 
 ```bash
-git clone https://github.com/3918109465-beep/claude-pro-pool.git
+git clone https://github.com/aaronyi97/claude-pro-pool.git
 cd claude-pro-pool
 bash ./install.sh
 export PATH="$HOME/.local/bin:$PATH"
@@ -31,7 +31,7 @@ export PATH="$HOME/.local/bin:$PATH"
 或者直接安装（仓库发布后可用）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/3918109465-beep/claude-pro-pool/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/aaronyi97/claude-pro-pool/main/install.sh | bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
 

@@ -54,7 +54,7 @@ class SyncTests(unittest.TestCase):
         (self.s.home / ".fake-launchctl").unlink()
         self.s.write("fake-policy.json", {"2": {"usageStatus": "no_credentials"}})
         output = self.s.manage("doctor", code=1)
-        self.assertIn("WARN 同步服务已加载", output)
+        self.assertIn("WARN 同步服务未加载", output)
         self.assertIn("reauth 2", output)
 
     def test_doctor_detects_profile_identity_mismatch_even_with_cached_quota(self):

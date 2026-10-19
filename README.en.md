@@ -5,7 +5,7 @@ Keep your main Claude Code conversation focused on coordination. Dispatch heavy 
 **Requires macOS, Claude Code CLI, and two or more personal Pro/Max subscriptions.** Linux and Windows installation are not supported in this release. No preinstalled claude-swap or Python is required.
 
 ```bash
-git clone https://github.com/3918109465-beep/claude-pro-pool.git
+git clone https://github.com/aaronyi97/claude-pro-pool.git
 cd claude-pro-pool
 bash ./install.sh
 export PATH="$HOME/.local/bin:$PATH"
@@ -17,7 +17,7 @@ claude-pro-pool doctor
 Log into your usual main account first with `claude auth login` if needed. The second command opens the official browser login for another account and asks you to verify the identity. Repeat for further accounts. A direct installer is available after publication:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/3918109465-beep/claude-pro-pool/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/aaronyi97/claude-pro-pool/main/install.sh | bash
 ```
 
 Start a new normal `claude` conversation. Installed rules request automatic delegation of heavy reading, code inspection, tests and scripting. Model behavior is not guaranteed. The main conversation runs `dispatch-claude run --prompt-file /absolute/task.md` using its Bash tool's background mode; leave the dispatcher's default wait enabled so the tool delivers completion. Detached terminal jobs can use `--no-wait`, then `wait JOB`. Desktop notifications are best effort.
