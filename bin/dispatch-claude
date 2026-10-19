@@ -27,8 +27,8 @@ SESS = HOME / ".claude-swap-backup" / "sessions"
 DEFAULT_DIR = HOME / ".claude"
 STATE = Path(os.environ.get("CLAUDE_PRO_POOL_HOME", HOME / ".claude-pro-pool")).expanduser()
 JOBS = Path(os.environ.get("CLAUDE_PRO_POOL_JOBS", STATE / "jobs")).expanduser().resolve()
-CSWAP = os.environ.get("CLAUDE_PRO_POOL_SWAP") or str(STATE / "deps/bin/claude-swap")
-if not Path(CSWAP).is_file():
+CSWAP = os.environ.get("CLAUDE_PRO_POOL_SWAP") or str(STATE / "runtime/bin/pool-swap")
+if not os.environ.get("CLAUDE_PRO_POOL_SWAP") and not Path(CSWAP).is_file():
     CSWAP = shutil.which("claude-swap") or CSWAP
 
 H5_MAX, D7_MAX = 80.0, 95.0          # 派新任务的门槛（已用百分比）
@@ -488,6 +488,10 @@ def execute_worker(job_id):
     pending = job.pop("pending")
     switches = transient = 0
     while True:
+        if (jd / "cancel").exists():
+            job.update(status="cancelled", running_account=None, error="按取消信号停下")
+            save(job)
+            return
         sid = job["session_id"]
         holder_dir = account_dir(job["holder"]) if job.get("holder") else None
         has_record = bool(find_record(holder_dir, sid))

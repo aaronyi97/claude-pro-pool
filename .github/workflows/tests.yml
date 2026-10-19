@@ -1,0 +1,14 @@
+name: macOS tests
+on: [push, pull_request]
+jobs:
+  synthetic:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test only synthetic accounts and system services
+        env:
+          CPP_TEST_ROOT: ${{ runner.temp }}/pool-test-homes
+        run: bash tests/run.sh

@@ -122,11 +122,25 @@ class Managed:
             self.save()
         return self.data["entries"][key]
 
+    def snapshot(self, path):
+        """Retain the immediate pre-change version, including edits after install."""
+        path = Path(path)
+        if not exists(path) or not path.is_file() or path.is_symlink():
+            return
+        content = path.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        target = STATE / "backups/versions" / digest
+        if not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            shutil.copy2(path, target)
+
     def link(self, src, dest):
         src, dest = Path(src), Path(dest)
         if dest.is_symlink() and dest.resolve() == src.resolve():
             return
         entry = self.remember(dest)
+        if entry.get("installed") and fingerprint(dest) != entry["installed"]:
+            raise RuntimeError(f"同步目标已被用户替换，保留原样：{dest}；手工合并后再 sync")
         self.mkdir(dest.parent)
         # Track intention before mutation, so an interrupted install is reversible.
         entry["installed"] = "link:" + str(src)
@@ -144,28 +158,32 @@ class Managed:
         self.mkdir(dest.parent)
         entry["installed"] = "file:" + hashlib.sha256(content).hexdigest()
         self.save()
+        self.snapshot(dest)
         write_bytes(dest, content, mode)
 
     def block(self, path, tag, body):
         path = Path(path)
         if path.is_symlink():
             path = path.resolve()
-        entry = self.remember(path, "block")
         start, end = f"<!-- claude-pro-pool:{tag}:BEGIN -->", f"<!-- claude-pro-pool:{tag}:END -->"
         if tag == "path":
             start, end = f"# claude-pro-pool:{tag}:BEGIN", f"# claude-pro-pool:{tag}:END"
         content = path.read_bytes() if path.exists() else b""
+        old_content = content
         pattern = re.compile(rb"\n\n" + re.escape(start.encode()) + rb".*?" + re.escape(end.encode()) + rb"\n", re.S)
         if content.count(start.encode()) != content.count(end.encode()):
             raise RuntimeError(f"标记块不完整，请修复后重试：{path}")
         if start.encode() in content and not pattern.search(content):
             raise RuntimeError(f"标记块已被移动，请先移除该块后重试：{path}")
+        entry = self.remember(path, "block")
         new = f"\n\n{start}\n{body.rstrip()}\n{end}\n".encode()
         content = pattern.sub(b"", content) + new
         entry.update(start=start, end=end)
         self.mkdir(path.parent)
         self.save()
-        write_bytes(path, content, path.stat().st_mode & 0o777 if path.exists() else 0o600)
+        if content != old_content:
+            self.snapshot(path)
+            write_bytes(path, content, path.stat().st_mode & 0o777 if path.exists() else 0o600)
 
     def restore(self):
         conflicts = []
@@ -173,6 +191,7 @@ class Managed:
             path = Path(key)
             if entry["kind"] == "block":
                 if not path.exists():
+                    self.data["entries"].pop(key, None)
                     continue
                 content = path.read_bytes()
                 pattern = re.compile(rb"\n\n" + re.escape(entry["start"].encode()) + rb".*?" + re.escape(entry["end"].encode()) + rb"\n", re.S)
@@ -183,6 +202,7 @@ class Managed:
                 if not entry["original"] and not cleaned:
                     path.unlink()
                 else:
+                    self.snapshot(path)
                     write_bytes(path, cleaned, path.stat().st_mode & 0o777)
             elif fingerprint(path) == entry.get("installed"):
                 remove(path)
@@ -212,11 +232,13 @@ def clean_env(profile=None):
     env["PATH"] = str(STATE / "deps/bin") + os.pathsep + env.get("PATH", "")
     if profile:
         env["CLAUDE_CONFIG_DIR"] = str(profile)
+    # The management parent holds .manage.lock while waiting on upstream.
+    env["CLAUDE_PRO_POOL_MANAGE_LOCK_HELD"] = "1"
     return env
 
 
 def swap():
-    return os.environ.get("CLAUDE_PRO_POOL_SWAP") or str(STATE / "deps/bin/claude-swap")
+    return os.environ.get("CLAUDE_PRO_POOL_SWAP") or str(STATE / "runtime/bin/pool-swap")
 
 
 def run(args, **kwargs):
@@ -256,11 +278,14 @@ def install():
     if sys.platform != "darwin":
         raise RuntimeError("首版安装仅支持 macOS；Linux/Windows 暂不支持")
     m = Managed()
+    import shlex
+    adapter = ("#!/bin/sh\nexport CLAUDE_PRO_POOL_HOME=" + shlex.quote(str(STATE)) +
+               "\nexec " + shlex.quote(sys.executable) + " -I " + shlex.quote(str(SOURCE / "lib/swap_adapter.py")) + ' "$@"\n')
+    write_bytes(SOURCE / "bin/pool-swap", adapter.encode(), 0o755)
     m.block(CONFIG / "CLAUDE.md", "rules", (SOURCE / "templates/CLAUDE.md").read_text())
     m.link(SOURCE / "skills/claude-pro-pool", CONFIG / "skills/claude-pro-pool")
     for command in ("claude-pro-pool", "dispatch-claude"):
         # A shell wrapper pins the private Python and relocatable runtime.
-        import shlex
         script = ("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " -I " +
                   shlex.quote(str(SOURCE / ("lib/pool.py" if command == "claude-pro-pool" else "bin/dispatch-claude"))) + ' "$@"\n')
         script = script.replace("\nexec ", "\nexport CLAUDE_PRO_POOL_HOME=" + shlex.quote(str(STATE)) + "\nexec ")
@@ -296,6 +321,9 @@ def sync():
                 if memory.is_symlink() and memory.resolve() == shared.resolve():
                     continue
                 if memory.is_dir() and not memory.is_symlink():
+                    if any(p.is_symlink() for p in memory.rglob("*")):
+                        warnings.append(f"memory-CONFLICT: {profile.name}/{project.name}: 含符号链接，保留原目录")
+                        continue
                     files = [p for p in memory.rglob("*") if p.is_file() and not p.is_symlink()]
                     conflicts = [p.relative_to(memory) for p in files if (shared / p.relative_to(memory)).exists()
                                  and p.read_bytes() != (shared / p.relative_to(memory)).read_bytes()]
@@ -323,6 +351,7 @@ def sync():
                 entry.setdefault("added_mcp", {}).update(missing)
                 m.save()
                 data.setdefault("mcpServers", {}).update(missing)
+                m.snapshot(target)
                 write_json(target, data)
     write_json(STATE / "sync-status.json", {"at": time.time(), "warnings": warnings})
     for warning in warnings:
@@ -353,7 +382,7 @@ def add_account(args):
     if matching:
         print(f"该账号已在号池 acc{matching[0]}，未重复添加。重登现有账号请用 reauth。")
         return
-    number = args.slot or (max([int(n) for n in seq.get("accounts", {})] + [0]) + 1)
+    number = args.slot if args.slot is not None else (max([int(n) for n in seq.get("accounts", {})] + [0]) + 1)
     if number < 1 or str(number) in seq.get("accounts", {}):
         raise RuntimeError("目标编号已占用或无效；未覆盖任何账号")
     print(f"登录核对：{identity.get('email', '(CLI 未返回身份)')}；将保存为 acc{number}", flush=True)
@@ -466,6 +495,7 @@ def uninstall():
             if data == original:
                 shutil.copy2(entry["backup"], path)
             else:
+                m.snapshot(path)
                 write_json(path, data)
         m.data["entries"].pop(key)
     m.save()

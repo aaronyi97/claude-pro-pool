@@ -65,3 +65,23 @@ class ManagedTests(unittest.TestCase):
         self.assertFalse(dst.is_symlink())
         self.assertEqual((dst / "mine.md").read_text(), "Keep me")
 
+    def test_later_user_replacement_is_not_overwritten_on_sync(self):
+        src, dst = self.home / "source", self.home / "destination"
+        src.write_text("shared")
+        self.m.link(src, dst)
+        dst.unlink()
+        dst.write_text("new user content")
+        with self.assertRaises(RuntimeError):
+            self.m.link(src, dst)
+        self.assertEqual(dst.read_text(), "new user content")
+
+    def test_installing_over_command_symlink_does_not_modify_its_target(self):
+        target = self.home / "custom-script"
+        target.write_text("custom script")
+        command = self.home / "command"
+        command.symlink_to(target)
+        self.m.file(command, b"new command")
+        self.assertEqual(target.read_text(), "custom script")
+        self.m.restore()
+        self.assertTrue(command.is_symlink())
+
