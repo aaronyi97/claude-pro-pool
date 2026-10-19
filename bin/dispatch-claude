@@ -1,0 +1,879 @@
+#!/usr/bin/env -S python3 -I
+"""Dispatch background Claude Code jobs across personal Pro/Max subscriptions.
+
+Commands: accounts, run, ask, continue, wait, status, logs, cancel.
+Run/ask/continue wait by default: use the parent Claude Bash tool's background
+mode for its completion notification. --no-wait detaches; wait JOB reattaches.
+Jobs default to ~/.claude-pro-pool/jobs; CLAUDE_PRO_POOL_JOBS overrides it.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+SESS = HOME / ".claude-swap-backup" / "sessions"
+DEFAULT_DIR = HOME / ".claude"
+STATE = Path(os.environ.get("CLAUDE_PRO_POOL_HOME", HOME / ".claude-pro-pool")).expanduser()
+JOBS = Path(os.environ.get("CLAUDE_PRO_POOL_JOBS", STATE / "jobs")).expanduser().resolve()
+CSWAP = os.environ.get("CLAUDE_PRO_POOL_SWAP") or str(STATE / "deps/bin/claude-swap")
+if not Path(CSWAP).is_file():
+    CSWAP = shutil.which("claude-swap") or CSWAP
+
+H5_MAX, D7_MAX = 80.0, 95.0          # 派新任务的门槛（已用百分比）
+H5_FOLLOW, D7_FOLLOW = 95.0, 99.0    # 追问/续跑时留在原号的门槛
+MAX_SWITCHES = 5                     # 一个任务最多因额度/登录问题换几次号
+MAX_TRANSIENT = 2                    # 临时性接口错误（过载、5xx）原号重试次数
+DEFAULT_TIMEOUT = 3 * 3600           # 每一轮的超时
+RESULT_PRINT_CAP = 6000
+TERMINAL = {"done", "failed", "timeout", "cancelled", "no-account"}
+EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+
+# 子进程绝不能带走主对话的身份。CLAUDE_SECURESTORAGE_CONFIG_DIR 决定去钥匙串取哪个号的凭据，
+STRIP_ENV = {
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_PID", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_AGENT_SDK_VERSION", "CLAUDE_EFFORT",
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+}
+
+PREFACE = (
+    "【派单说明】你是 dispatch-claude 派出的子任务执行者，任务编号 {job}。"
+    "直接完成任务单；不得调用 dispatch-claude 或再派子 Agent。"
+    "CLAUDE.md 中主对话派单规则对你不适用。遵守项目规则与用户授权边界。"
+    "每完成一份产物就落盘，续跑先核对已完成进度。最后按任务单要求简洁回报。"
+)
+CONTINUE_PROMPT = (
+    "【续接】上一轮在中途被中断（额度用完、超时或出错），对话记录完整保留，现在接着跑，可能已换到另一个账号。"
+    "请从中断处继续你正在处理的请求：先核对已经落盘的产物和已完成的步骤，不要重做已完成的部分，"
+    "然后完成剩下的工作，最后按原任务单要求回报。"
+)
+
+LIMIT_RE = re.compile(r"hit your .{0,20}limit|usage limit|limit reached|rate.?limit", re.I)
+AUTH_RE = re.compile(r"not logged in|please run /login|oauth token|oauth session expired|failed to authenticate|could not be refreshed|authentication_error|invalid api key", re.I)
+TERMS_RE = re.compile(r"consumer terms|updated our .{0,40}(terms|privacy)|(accept|agree to).{0,60}(terms|privacy policy)", re.I)
+BAD_TTL = {"terms": 30 * 60, "auth": 10 * 60}  # 标记“暂时不用”的时长（秒）：到点自动再试一次，成功一次就解除
+BAD_WHY = {"terms": "服务条款未同意，需本人登录 claude.ai 同意", "auth": "登录凭据刚失效"}
+TRANSIENT_RE = re.compile(r"overloaded|api error: 5\d\d|internal server error|econnreset|socket hang up|timed? ?out", re.I)
+
+
+# ---------- 小工具 ----------
+
+def now() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def die(msg: str, code: int = 2):
+    print(f"[dispatch-claude] {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def read_json(p, default=None):
+    try:
+        return json.loads(Path(p).read_text())
+    except Exception:
+        return default
+
+
+def write_json(p, obj):
+    p = Path(p)
+    tmp = p.with_name(p.name + "." + uuid.uuid4().hex + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+    os.replace(tmp, p)
+
+
+def pid_alive(pid) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def proc_is_claude(pid) -> bool:
+    try:
+        out = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return True
+    return "claude" in out.lower()
+
+
+def kill_tree(pid):
+    """停掉进程和它所有子孙进程：Claude Code 跑的命令在单独的进程组里，只停 claude 会留下残留。"""
+    try:
+        out = subprocess.run(["ps", "-ax", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        out = ""
+    kids: dict = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            kids.setdefault(int(parts[1]), []).append(int(parts[0]))
+    procs, stack = [int(pid)], [int(pid)]
+    while stack:
+        for c in kids.get(stack.pop(), []):
+            procs.append(c)
+            stack.append(c)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for q in procs:
+            if pid_alive(q):
+                try:
+                    os.kill(q, sig)
+                except Exception:
+                    pass
+        if sig == signal.SIGTERM:
+            for _ in range(10):
+                if not any(pid_alive(q) for q in procs):
+                    return
+                time.sleep(1)
+
+
+def parse_ts(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def fmt_dur(sec) -> str:
+    sec = int(sec or 0)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
+
+
+def require_jobs():
+    JOBS.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+
+def permission_mode():
+    cfg = read_json(STATE / "config.json", {}) or {}
+    mode = os.environ.get("CLAUDE_PRO_POOL_PERMISSION_MODE", cfg.get("permission_mode", "bypassPermissions"))
+    if mode not in {"bypassPermissions", "default", "acceptEdits", "plan", "dontAsk"}:
+        die("无效 permission_mode；使用 bypassPermissions/default/acceptEdits/plan/dontAsk")
+    return mode
+
+
+# ---------- 账号 ----------
+
+def account_dir(num):
+    hits = sorted(SESS.glob(f"{num}-*"))
+    return hits[0] if hits else None
+
+
+def caller_account(active_num):
+    """主对话自己用的号：看 CLAUDE_CONFIG_DIR；没设或是 ~/.claude 就是默认登录号。"""
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not cfg:
+        return active_num
+    p = Path(cfg).expanduser().resolve()
+    try:
+        return int(p.relative_to(SESS.resolve()).parts[0].split("-", 1)[0])
+    except Exception:
+        return active_num if p == DEFAULT_DIR.resolve() else None
+
+
+def interactive_count(cfg_dir) -> int:
+    n = 0
+    for f in Path(cfg_dir, "sessions").glob("*.json"):
+        d = read_json(f, {}) or {}
+        if str(d.get("entrypoint", "")).startswith("sdk"):  # 无界面 -p 任务（包括我们自己派的）也登记成 interactive，不算主对话
+            continue
+        if d.get("kind") == "interactive" and pid_alive(d.get("pid")) and proc_is_claude(d.get("pid")):
+            n += 1
+    return n
+
+
+def running_jobs_by_account() -> dict:
+    cnt: dict = {}
+    for m in JOBS.glob("*/meta.json"):
+        d = read_json(m, {}) or {}
+        a = d.get("running_account")
+        if a and d.get("status") == "running" and pid_alive(d.get("worker_pid")):
+            cnt[a] = cnt.get(a, 0) + 1
+    return cnt
+
+
+BAD_FILE = JOBS / ".bad-accounts.json"
+
+
+def bad_accounts() -> dict:
+    d = read_json(BAD_FILE, {}) or {}
+    t = time.time()
+    return {k: v for k, v in d.items() if isinstance(v, dict) and v.get("until", 0) > t}
+
+
+def mark_bad(num, kind):
+    with open(JOBS / ".bad.lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        d = bad_accounts()
+        d[str(num)] = dict(kind=kind, at=now(), until=time.time() + BAD_TTL[kind])
+        write_json(BAD_FILE, d)
+
+
+def clear_bad(num):
+    if str(num) not in bad_accounts():
+        return
+    with open(JOBS / ".bad.lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        d = bad_accounts()
+        if d.pop(str(num), None) is not None:
+            write_json(BAD_FILE, d)
+
+
+def fetch_accounts() -> dict:
+    try:
+        env = {k: v for k, v in os.environ.items() if k not in STRIP_ENV and k != "CLAUDE_CONFIG_DIR"}
+        r = subprocess.run([CSWAP, "list", "--json"], env=env, capture_output=True, text=True, timeout=120, cwd=str(HOME))
+        if r.returncode:
+            raise ValueError(f"claude-swap exit {r.returncode}")
+        data = json.loads(r.stdout)
+        if not isinstance(data.get("accounts"), list):
+            raise ValueError("无效账号表")
+        return data
+    except Exception as e:
+        die(f"读不到 claude-swap 的账号余量：{e}", 3)
+
+
+def evaluate(data, caller, exclude=(), follow=False) -> list:
+    active = data.get("activeAccountNumber")
+    jobs = running_jobs_by_account()
+    bad = bad_accounts()
+    h5max, d7max = (H5_FOLLOW, D7_FOLLOW) if follow else (H5_MAX, D7_MAX)
+    rows = []
+    for a in data.get("accounts", []):
+        n = a.get("number")
+        u = a.get("usage") or {}
+        h5 = (u.get("fiveHour") or {}).get("pct")
+        d7w = u.get("sevenDay") or {}
+        d7 = d7w.get("pct")
+        d = account_dir(n)
+        busy = interactive_count(d) if d else 0
+        if n == active:
+            busy += interactive_count(DEFAULT_DIR)
+        why = []
+        if n == caller:
+            why.append("主对话自己的号")
+        elif a.get("active"):
+            why.append("claude-swap 默认登录号")
+        if a.get("disabled"):
+            why.append("已在 claude-swap 停用")
+        if d is None:
+            why.append("没有账号目录")
+        if n in exclude:
+            why.append("本任务里撞过限额或登录失败")
+        b = bad.get(str(n))
+        if b:
+            left = max(1, int((b["until"] - time.time()) / 60))
+            why.append(f"{BAD_WHY.get(b['kind'], b['kind'])}（{b['at'][11:16]} 起，约 {left} 分钟后自动再试）")
+        if busy and n != caller:
+            why.append(f"开着 {busy} 个交互主对话")
+        if a.get("usageStatus") != "ok" or h5 is None or d7 is None:
+            why.append(f"额度读不到（{a.get('usageStatus')}）")
+        else:
+            if h5 >= h5max:
+                why.append(f"5 小时已用 {h5:.0f}%")
+            if d7 >= d7max:
+                why.append(f"本周已用 {d7:.0f}%")
+        rows.append(dict(num=n, alias=a.get("alias") or f"acc{n}", h5=h5, d7=d7,
+                         reset=parse_ts(d7w.get("resetsAt")), reset_label=d7w.get("countdown") or "-",
+                         busy=busy, jobs=jobs.get(n, 0), why=why, dir=str(d) if d else None))
+    return rows
+
+
+def rank(rows) -> list:
+    ok = [r for r in rows if not r["why"]]
+    ok.sort(key=lambda r: (r["jobs"], r["reset"] or float("inf"), r["h5"]))
+    return ok
+
+
+def choose(job, first_round: bool):
+    """返回 (选中的账号行 或 None, 全部账号行)。"""
+    data = fetch_accounts()
+    caller = job.get("caller_account")
+    exclude = set(job.get("excluded", []))
+    rows = evaluate(data, caller, exclude)
+    force = job.pop("force_next", None) or (job.get("force_account") if first_round else None)
+    if force:
+        hit = [r for r in rows if r["num"] == force and r["dir"]]
+        return (hit[0] if hit else None), rows
+    holder = job.get("holder")
+    if holder and holder not in exclude:
+        frows = evaluate(data, caller, exclude, follow=True)
+        h = [r for r in frows if r["num"] == holder and not r["why"]]
+        if h:
+            return h[0], rows
+    ok = rank(rows)
+    return (ok[0] if ok else None), rows
+
+
+# ---------- 对话记录搬运 ----------
+
+def find_record(cfg_dir, sid):
+    if not cfg_dir:
+        return None
+    hits = list(Path(cfg_dir, "projects").glob(f"*/{sid}.jsonl"))
+    return hits[0] if hits else None
+
+
+def migrate(sid, src_dir, dst_dir) -> bool:
+    rec = find_record(src_dir, sid)
+    if not rec:
+        return False
+    dst_proj = Path(dst_dir, "projects", rec.parent.name)
+    dst_proj.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(rec, dst_proj / rec.name)
+    side = rec.parent / sid  # 子 Agent 记录、大段工具输出
+    if side.is_dir():
+        shutil.copytree(side, dst_proj / sid, dirs_exist_ok=True)
+    for sub in ("file-history", "session-env"):
+        s = Path(src_dir, sub, sid)
+        if s.is_dir():
+            shutil.copytree(s, Path(dst_dir, sub, sid), dirs_exist_ok=True)
+    return True
+
+
+# ---------- 任务 ----------
+
+def job_dir(job_id) -> Path:
+    d = JOBS / job_id
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
+        die("任务编号无效")
+    if not (d / "meta.json").exists():
+        die(f"找不到任务 {job_id}")
+    return d
+
+
+def load(job_id) -> dict:
+    return read_json(job_dir(job_id) / "meta.json")
+
+
+def save(job):
+    write_json(JOBS / job["id"] / "meta.json", job)
+
+
+def read_prompt(args) -> str:
+    if getattr(args, "prompt", None):
+        return args.prompt
+    if getattr(args, "prompt_file", None):
+        return sys.stdin.read() if args.prompt_file == "-" else Path(args.prompt_file).read_text()
+    die("要给 --prompt 或 --prompt-file")
+
+
+def parse_stream(path) -> dict:
+    res = dict(result=None, is_error=None, limit=False, auth=False, api_error=None,
+               model=None, num_turns=None, windows=None)
+    try:
+        lines = open(path, errors="replace").read().splitlines()
+    except Exception:
+        lines = []
+    for line in lines:
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        t = ev.get("type")
+        if t == "system" and ev.get("subtype") == "init":
+            res["model"] = ev.get("model")
+        elif t == "rate_limit_event":
+            info = ev.get("rate_limit_info") or {}
+            res["windows"] = info.get("unifiedWindows") or res["windows"]
+            if info.get("status") == "rejected":
+                res["limit"] = True
+        elif t == "assistant":
+            e = ev.get("error")
+            if e == "rate_limit":
+                res["limit"] = True
+            elif e and "auth" in str(e):
+                res["auth"] = True
+            elif e:
+                res["api_error"] = e
+        elif t == "result":
+            res.update(result=ev.get("result"), is_error=ev.get("is_error"), num_turns=ev.get("num_turns"))
+    if res["is_error"] or res["result"] is None:
+        txt = res["result"] or ""
+        res["limit"] = res["limit"] or bool(LIMIT_RE.search(txt))
+        res["auth"] = res["auth"] or bool(AUTH_RE.search(txt))
+    return res
+
+
+def run_round(job, i, acct, prompt_file, resume) -> tuple:
+    jd = JOBS / job["id"]
+    env = {k: v for k, v in os.environ.items() if k not in STRIP_ENV}
+    env["CLAUDE_CONFIG_DIR"] = acct["dir"]  # 保持有值，免得 cswap 走“默认登录号直启”
+    env["PATH"] = str(STATE / "deps/bin") + os.pathsep + env.get("PATH", "")  # cswap 按 PATH 找 claude，要找到 ~/.local/bin 那个
+    env["DISPATCH_CLAUDE_DEPTH"] = "1"
+    env["DISPATCH_CLAUDE_JOB"] = job["id"]
+    cmd = [CSWAP, "run", str(acct["num"]), "--", "-p", "--output-format", "stream-json", "--verbose",
+           "--permission-mode", job.get("permission_mode", "bypassPermissions"), "--disallowedTools=Agent",
+           "--append-system-prompt", PREFACE.format(job=job["id"])]
+    if job.get("model"):
+        cmd += ["--model", job["model"]]
+    if job.get("effort"):
+        cmd += ["--effort", job["effort"]]
+    if job.get("agent"):
+        cmd += ["--agent", job["agent"]]
+    cmd += ["--resume", job["session_id"]] if resume else ["--session-id", job["session_id"]]
+    stream, errf = jd / f"stream-{i:02d}.jsonl", jd / f"stderr-{i:02d}.log"
+    with open(prompt_file) as fin, open(stream, "w") as fout, open(errf, "w") as ferr:
+        p = subprocess.Popen(cmd, cwd=job["cwd"], env=env, stdin=fin, stdout=fout, stderr=ferr)
+        job["claude_pid"] = p.pid
+        save(job)
+        deadline = time.time() + job.get("timeout", DEFAULT_TIMEOUT)
+        outcome = None
+        while p.poll() is None:
+            if (jd / "cancel").exists():
+                outcome = "cancelled"
+            elif time.time() > deadline:
+                outcome = "timeout"
+            if outcome:
+                kill_tree(p.pid)
+                try:
+                    p.wait(15)
+                except subprocess.TimeoutExpired:
+                    pass
+                break
+            time.sleep(2)
+    if outcome is None and (jd / "cancel").exists():
+        outcome = "cancelled"
+    res = parse_stream(stream)
+    if outcome is None:
+        errtxt = Path(errf).read_text(errors="replace")[-4000:]
+        failed = bool(res["is_error"]) or res["result"] is None
+        if res["limit"]:
+            outcome = "limit"
+        elif failed and TERMS_RE.search((res["result"] or "") + errtxt + str(res["api_error"] or "")):
+            outcome = "unusable"
+        elif res["auth"] or (res["result"] is None and AUTH_RE.search(errtxt)):
+            outcome = "auth"
+        elif res["result"] is not None and not res["is_error"] and p.returncode == 0:
+            outcome = "ok"
+        else:
+            outcome = "transient" if TRANSIENT_RE.search((res["result"] or "") + errtxt + str(res["api_error"] or "")) else "error"
+    return outcome, res
+
+
+def execute_worker(job_id):
+    jd = JOBS / job_id
+    lockf = open(jd / "lock", "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return
+    job = load(job_id)
+    job.update(status="running", worker_pid=os.getpid(), error=None)
+    save(job)
+    pending = job.pop("pending")
+    switches = transient = 0
+    while True:
+        sid = job["session_id"]
+        holder_dir = account_dir(job["holder"]) if job.get("holder") else None
+        has_record = bool(find_record(holder_dir, sid))
+        if not has_record and pending["kind"] != "start":
+            pending = {"kind": "start", "prompt_file": "prompt-00.md"}  # 记录没生成过：从原任务重来
+        with open(JOBS / ".choose.lock", "w") as cl:  # 同时派多个任务时挨个选号，免得挤到同一个号
+            fcntl.flock(cl, fcntl.LOCK_EX)
+            acct, rows = choose(job, first_round=not job["rounds"])
+            if acct is None:
+                job.update(status="no-account", running_account=None,
+                           reasons={r["alias"]: "、".join(r["why"]) or "可用" for r in rows})
+                save(job)
+                return
+            job["running_account"] = acct["num"]
+            save(job)
+        moved = False
+        if has_record and acct["num"] != job["holder"]:
+            moved = migrate(sid, holder_dir, acct["dir"])
+        i = len(job["rounds"])
+        rnd = dict(i=i, kind=pending["kind"], account=acct["num"], alias=acct["alias"], moved_record=moved,
+                   started_at=now(), prompt_file=pending["prompt_file"])
+        job["rounds"].append(rnd)
+        job["running_account"] = acct["num"]
+        save(job)
+        t0 = time.time()
+        outcome, res = run_round(job, i, acct, jd / pending["prompt_file"], resume=has_record)
+        rnd.update(ended_at=now(), seconds=int(time.time() - t0), outcome=outcome, model=res["model"],
+                   num_turns=res["num_turns"], windows=res["windows"])
+        if find_record(acct["dir"], sid):
+            job["holder"] = acct["num"]
+        job["running_account"] = None
+        if outcome == "ok":
+            clear_bad(acct["num"])
+            (jd / f"result-{i:02d}.md").write_text(res["result"] or "")
+            (jd / "result.md").write_text(res["result"] or "")
+            job["status"] = "done"
+            save(job)
+            return
+        if outcome in ("unusable", "auth"):
+            mark_bad(acct["num"], "terms" if outcome == "unusable" else "auth")
+        if outcome in ("limit", "auth", "unusable") and switches < MAX_SWITCHES:
+            switches += 1
+            job.setdefault("excluded", []).append(acct["num"])
+            (jd / "prompt-continue.md").write_text(CONTINUE_PROMPT)
+            pending = {"kind": "auto-continue", "prompt_file": "prompt-continue.md"}
+            save(job)
+            continue
+        if outcome == "transient" and transient < MAX_TRANSIENT:
+            transient += 1
+            (jd / "prompt-continue.md").write_text(CONTINUE_PROMPT)
+            pending = {"kind": "retry", "prompt_file": "prompt-continue.md"}
+            save(job)
+            time.sleep(60)
+            continue
+        job["status"] = {"cancelled": "cancelled", "timeout": "timeout"}.get(outcome, "failed")
+        job["error"] = {"limit": "换号次数用完仍撞限额", "auth": "换号次数用完仍登录失败",
+                        "unusable": "换号次数用完，仍有账号因服务条款未同意不能用",
+                        "cancelled": "按取消信号停下", "timeout": f"超过 {fmt_dur(job.get('timeout'))} 未完成"}.get(
+            outcome, (res["result"] or "")[:500] or f"进程异常结束，见 stderr-{i:02d}.log")
+        save(job)
+        return
+
+
+def spawn_worker(job):
+    # Gate the child until its PID has been saved. A fast child must not have its
+    # terminal metadata overwritten by the launching process.
+    reader, writer = os.pipe()
+    env = dict(os.environ, CLAUDE_PRO_POOL_START_FD=str(reader))
+    try:
+        with open(JOBS / job["id"] / "worker.log", "a") as log:
+            p = subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "_worker", job["id"]],
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                                 pass_fds=(reader,), env=env, cwd=str(JOBS / job["id"]))
+        job["worker_pid"] = p.pid
+        save(job)
+    finally:
+        os.close(reader)
+        os.close(writer)
+
+
+def worker(job_id):
+    gate = os.environ.pop("CLAUDE_PRO_POOL_START_FD", None)
+    if gate:
+        os.read(int(gate), 1)
+        os.close(int(gate))
+    try:
+        execute_worker(job_id)
+    except BaseException as error:
+        job = load(job_id)
+        job.update(status="failed", running_account=None, error=f"后台执行异常：{type(error).__name__}；见 worker.log")
+        save(job)
+        raise
+    finally:
+        job = load(job_id)
+        if job.get("status") in TERMINAL:
+            write_json(JOBS / job_id / "completion.json", {"job": job_id, "status": job["status"], "at": now()})
+            config = read_json(STATE / "config.json", {}) or {}
+            if config.get("desktop_notifications", True) and sys.platform == "darwin" and shutil.which("osascript"):
+                script = 'on run argv\ndisplay notification (item 1 of argv) with title "claude-pro-pool"\nend run'
+                try:
+                    subprocess.run(["osascript", "-e", script, f"{job_id}: {job['status']}"],
+                                   capture_output=True, timeout=10)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+
+
+# ---------- 回执与展示 ----------
+
+STATUS_CN = {"queued": "排队", "running": "运行中", "done": "完成", "failed": "失败", "timeout": "超时",
+             "cancelled": "已取消", "no-account": "没有可用账号"}
+
+
+def receipt(job) -> str:
+    jd = JOBS / job["id"]
+    rounds = job.get("rounds", [])
+    path = " → ".join(dict.fromkeys(r["alias"] for r in rounds)) or "-"
+    last = rounds[-1] if rounds else {}
+    secs = sum(r.get("seconds", 0) for r in rounds)
+    switches = sum(1 for r in rounds if r.get("kind") == "auto-continue")
+    head = (f"[dispatch-claude] 任务 {job['id']}（{job.get('name') or '-'}）：{STATUS_CN.get(job['status'], job['status'])}"
+            f"｜账号 {path}｜模型 {last.get('model') or '-'}｜轮次 {len(rounds)}｜自动换号 {switches}｜用时 {fmt_dur(secs)}")
+    out = [head]
+    if job["status"] == "done":
+        text = (jd / "result.md").read_text()
+        out += [f"结果文件：{jd / 'result.md'}",
+                f"追问：dispatch-claude ask {job['id']} --prompt \"…\"",
+                "──── 结果 ────",
+                text[:RESULT_PRINT_CAP] + (f"\n…（已截断，全文见结果文件）" if len(text) > RESULT_PRINT_CAP else "")]
+    elif job["status"] == "no-account":
+        out.append("各号情况：" + "；".join(f"{k}：{v}" for k, v in (job.get("reasons") or {}).items()))
+        out.append("没有可用号时：改用内置子 Agent（吃主号额度），并在回复里告诉用户。")
+    else:
+        out.append(f"原因：{job.get('error') or '-'}")
+        out.append(f"任务目录：{jd}")
+        if job["status"] in ("failed", "timeout", "cancelled"):
+            out.append(f"从断点接着跑：dispatch-claude continue {job['id']}")
+    return "\n".join(out)
+
+
+def wait_job(job_id) -> int:
+    jd = job_dir(job_id)
+    while True:
+        job = read_json(jd / "meta.json")
+        if job["status"] in TERMINAL:
+            break
+        if not pid_alive(job.get("worker_pid")):
+            time.sleep(5)
+            job = read_json(jd / "meta.json")
+            if job["status"] not in TERMINAL:
+                job.update(status="failed", error="后台进程异常退出，见 worker.log", running_account=None)
+                save(job)
+            break
+        time.sleep(3)
+    print(receipt(job))
+    return {"done": 0, "no-account": 3, "timeout": 5, "cancelled": 6}.get(job["status"], 4)
+
+
+def summarize_input(name, inp) -> str:
+    for k in ("description", "command", "file_path", "pattern", "path", "url", "query", "prompt"):
+        if isinstance(inp, dict) and inp.get(k):
+            return str(inp[k]).replace("\n", " ")[:100]
+    return ""
+
+
+# ---------- 命令 ----------
+
+def cmd_accounts(_args):
+    require_jobs()
+    data = fetch_accounts()
+    rows = evaluate(data, caller_account(data.get("activeAccountNumber")))
+    order = {r["num"]: k + 1 for k, r in enumerate(rank(rows))}
+    for r in rows:
+        mark = f"✓ 第{order[r['num']]}" if r["num"] in order else "✗"
+        h5 = "-" if r["h5"] is None else f"{r['h5']:.0f}%"
+        d7 = "-" if r["d7"] is None else f"{r['d7']:.0f}%"
+        print(f"{mark:6} {r['alias']:6} 5小时 {h5:>4}  本周 {d7:>4}  周重置 {r['reset_label']:>8}  在跑派单 {r['jobs']}"
+              + (f"  ← {'、'.join(r['why'])}" if r["why"] else ""))
+
+
+def inherited_model():
+    """主对话当前用的模型。Claude Code 不会把模型放进环境变量（思考档位有 CLAUDE_EFFORT，模型没有），
+    所以读主对话自己的对话记录：从尾部往前找，先遇到的“助手回复的 model”或“/model 切换提示”就是当前模型。
+    读不到时返回 None，并明确提示使用配置默认模型。
+    """
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    cfg = Path(os.environ.get("CLAUDE_CONFIG_DIR") or DEFAULT_DIR).expanduser()
+    if not sid:
+        return None
+    for f in cfg.glob(f"projects/*/{sid}.jsonl"):
+        try:
+            size = f.stat().st_size
+            with open(f, "rb") as fh:
+                fh.seek(max(0, size - 6 * 1024 * 1024))
+                lines = fh.read().decode("utf-8", "replace").splitlines()
+        except Exception:
+            continue
+        for line in reversed(lines):
+            if '"model"' not in line and "Set model to" not in line:
+                continue
+            m = re.search(r"Set model to `([A-Za-z0-9._\[\]-]+)`", line)
+            if m and "local-command-stdout" in line:
+                return m.group(1)
+            if '"assistant"' in line:
+                try:
+                    mdl = (json.loads(line).get("message") or {}).get("model")
+                except Exception:
+                    continue
+                if mdl and not mdl.startswith("<"):
+                    return mdl
+    return None
+
+
+def cmd_run(args):
+    require_jobs()
+    if os.environ.get("DISPATCH_CLAUDE_DEPTH"):
+        die("你在派出的子任务里，不能再往下派。")
+    prompt = read_prompt(args)
+    if args.timeout <= 0:
+        die("--timeout 必须大于 0")
+    data = fetch_accounts()
+    cwd = os.path.abspath(args.cwd or os.getcwd())
+    if not os.path.isdir(cwd):
+        die(f"工作目录不存在：{cwd}")
+    # 默认继承主对话的思考档位；指定了 --agent 就让 agent 定义自己的 model/effort 说了算
+    inherited = os.environ.get("CLAUDE_EFFORT") if os.environ.get("CLAUDE_EFFORT") in EFFORTS else None
+    effort = args.effort or (None if args.agent else inherited)
+    model, model_src = args.model, "--model"
+    if not model and not args.agent:
+        model = inherited_model()
+        model_src = "继承主对话" if model else "没读到主对话模型，用默认"
+        if not model:
+            print("[dispatch-claude] 没读到主对话的模型，子任务将用 settings.json 的默认 model。要指定请加 --model。", file=sys.stderr)
+    job_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
+    jd = JOBS / job_id
+    jd.mkdir(parents=True)
+    (jd / "prompt-00.md").write_text(prompt)
+    job = dict(id=job_id, name=args.name, created_at=now(), cwd=cwd, model=model, model_source=model_src, effort=effort,
+               agent=args.agent, timeout=args.timeout, permission_mode=permission_mode(), session_id=str(uuid.uuid4()),
+               caller_account=caller_account(data.get("activeAccountNumber")), force_account=args.account,
+               status="queued", rounds=[], holder=None, excluded=[], running_account=None,
+               pending={"kind": "start", "prompt_file": "prompt-00.md"})
+    save(job)
+    spawn_worker(job)
+    if args.no_wait:
+        print(f"[dispatch-claude] 已派出 {job_id}。等结果：dispatch-claude wait {job_id}")
+        return 0
+    return wait_job(job_id)
+
+
+def follow_up(job_id, prompt, no_wait, account=None):
+    require_jobs()
+    jd = job_dir(job_id)
+    job = load(job_id)
+    if job["status"] in ("running", "queued") and pid_alive(job.get("worker_pid")):
+        die(f"任务 {job_id} 还在跑，等它结束再追问：dispatch-claude wait {job_id}")
+    data = fetch_accounts()
+    (jd / "cancel").unlink(missing_ok=True)
+    k = len(list(jd.glob("prompt-*.md")))
+    pf = f"prompt-f{k:02d}.md"
+    (jd / pf).write_text(prompt)
+    job.update(status="queued", pending={"kind": "ask" if prompt != CONTINUE_PROMPT else "continue", "prompt_file": pf},
+               caller_account=caller_account(data.get("activeAccountNumber")), excluded=[], error=None)
+    if account:
+        job["force_next"] = account
+    save(job)
+    spawn_worker(job)
+    if no_wait:
+        print(f"[dispatch-claude] 已续派 {job_id}。等结果：dispatch-claude wait {job_id}")
+        return 0
+    return wait_job(job_id)
+
+
+def cmd_ask(args):
+    return follow_up(args.job, read_prompt(args), args.no_wait, args.account)
+
+
+def cmd_continue(args):
+    return follow_up(args.job, CONTINUE_PROMPT, args.no_wait, args.account)
+
+
+def cmd_wait(args):
+    return wait_job(args.job)
+
+
+def cmd_status(args):
+    require_jobs()
+    if args.job:
+        job = load(args.job)
+        print(receipt(job) if job["status"] in TERMINAL else
+              f"[dispatch-claude] 任务 {job['id']}（{job.get('name') or '-'}）：{STATUS_CN.get(job['status'])}"
+              f"｜当前账号 acc{job.get('running_account') or '-'}｜已用轮次 {len(job['rounds'])}")
+        for r in job["rounds"]:
+            w = r.get("windows") or {}
+            util = (f"｜该号 5小时 {w.get('five_hour', {}).get('utilization', 0) * 100:.0f}% 本周 "
+                    f"{w.get('seven_day', {}).get('utilization', 0) * 100:.0f}%") if w else ""
+            print(f"  第{r['i']}轮 {r['kind']:13} {r['alias']:6} {r.get('outcome') or '进行中':10} "
+                  f"{fmt_dur(r.get('seconds'))}{'｜搬过记录' if r.get('moved_record') else ''}{util}")
+        return 0
+    metas = sorted(JOBS.glob("*/meta.json"), reverse=True)[:15]
+    for m in metas:
+        j = read_json(m, {}) or {}
+        acct = j["rounds"][-1]["alias"] if j.get("rounds") else "-"
+        print(f"{j.get('id')}  {STATUS_CN.get(j.get('status'), j.get('status')):6}  {acct:6}  "
+              f"轮次 {len(j.get('rounds', []))}  {j.get('name') or ''}")
+    return 0
+
+
+def cmd_logs(args):
+    jd = job_dir(args.job)
+    streams = sorted(jd.glob("stream-*.jsonl"))
+    if not streams:
+        print("还没有输出。")
+        return 0
+    lines = []
+    for line in streams[-1].read_text(errors="replace").splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if ev.get("type") == "assistant":
+            for c in (ev.get("message") or {}).get("content") or []:
+                if c.get("type") == "tool_use":
+                    lines.append(f"🔧 {c.get('name')}  {summarize_input(c.get('name'), c.get('input'))}")
+                elif c.get("type") == "text" and c.get("text", "").strip():
+                    lines.append("💬 " + c["text"].strip().replace("\n", " ")[:160])
+        elif ev.get("type") == "result":
+            lines.append(f"🏁 结束（{'出错' if ev.get('is_error') else '正常'}）")
+    print(f"[{streams[-1].name}] 最近 {args.n} 条：")
+    print("\n".join(lines[-args.n:]))
+    return 0
+
+
+def cmd_cancel(args):
+    jd = job_dir(args.job)
+    job = load(args.job)
+    (jd / "cancel").touch()  # 后台进程每 2 秒看一次，看到就停掉整棵进程树
+    if not pid_alive(job.get("worker_pid")) and pid_alive(job.get("claude_pid")):
+        kill_tree(job["claude_pid"])
+    print(f"[dispatch-claude] 已发取消信号：{args.job}。等它停下：dispatch-claude wait {args.job}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="dispatch-claude", description="把 Claude 子任务派到别的有额度的账号上跑")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("accounts")
+    r = sub.add_parser("run")
+    r.add_argument("--prompt")
+    r.add_argument("--prompt-file")
+    r.add_argument("--name")
+    r.add_argument("--model")
+    r.add_argument("--effort", choices=sorted(EFFORTS))
+    r.add_argument("--agent")
+    r.add_argument("--account", type=int)
+    r.add_argument("--cwd")
+    r.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    r.add_argument("--no-wait", action="store_true")
+    a = sub.add_parser("ask")
+    a.add_argument("job")
+    a.add_argument("--prompt")
+    a.add_argument("--prompt-file")
+    a.add_argument("--account", type=int)
+    a.add_argument("--no-wait", action="store_true")
+    c = sub.add_parser("continue")
+    c.add_argument("job")
+    c.add_argument("--account", type=int)
+    c.add_argument("--no-wait", action="store_true")
+    w = sub.add_parser("wait")
+    w.add_argument("job")
+    s = sub.add_parser("status")
+    s.add_argument("job", nargs="?")
+    lg = sub.add_parser("logs")
+    lg.add_argument("job")
+    lg.add_argument("-n", type=int, default=30)
+    k = sub.add_parser("cancel")
+    k.add_argument("job")
+    wk = sub.add_parser("_worker")
+    wk.add_argument("job")
+    args = ap.parse_args()
+    if args.cmd == "_worker":
+        return worker(args.job) or 0
+    return {"accounts": cmd_accounts, "run": cmd_run, "ask": cmd_ask, "continue": cmd_continue,
+            "wait": cmd_wait, "status": cmd_status, "logs": cmd_logs, "cancel": cmd_cancel}[args.cmd](args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
