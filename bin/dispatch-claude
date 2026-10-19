@@ -663,6 +663,8 @@ def cmd_accounts(_args):
     data = fetch_accounts()
     rows = evaluate(data, caller_account(data.get("activeAccountNumber")))
     order = {r["num"]: k + 1 for k, r in enumerate(rank(rows))}
+    if not rows:
+        print("号池里还没有号：先 claude-pro-pool add-account --current，再 claude-pro-pool add-account")
     for r in rows:
         mark = f"✓ 第{order[r['num']]}" if r["num"] in order else "✗"
         h5 = "-" if r["h5"] is None else f"{r['h5']:.0f}%"

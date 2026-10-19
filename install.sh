@@ -36,6 +36,7 @@ export UV_TOOL_BIN_DIR="$pool_state/deps/bin"
 export UV_PYTHON_INSTALL_DIR="$pool_state/deps/python"
 export UV_CACHE_DIR="$pool_state/cache/uv"
 "$pool_uv" tool install --python 3.12 claude-swap==0.26.0
+echo '（如果上面提示 deps/bin 不在 PATH，可以忽略：依赖装在本工具的私有目录，命令入口稍后放进 ~/.local/bin。）'
 pool_python="$UV_TOOL_DIR/claude-swap/bin/python"
 [ -x "$pool_python" ] || { echo '私有 Python 未安装；请检查 uv 输出。' >&2; exit 2; }
 mkdir -p "$pool_state/runtime"

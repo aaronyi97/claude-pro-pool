@@ -449,7 +449,7 @@ def doctor():
     check((CONFIG / "skills/claude-pro-pool/SKILL.md").is_file(), "派单 skill", "重新运行安装命令")
     check(PLIST.exists() and service_loaded(), "同步服务已加载", "在 GUI 登录会话中运行 claude-pro-pool sync-service")
     sync_state = read_json(STATE / "sync-status.json", {})
-    check(time.time() - sync_state.get("at", 0) < 660, "最近 11 分钟同步成功", "运行 claude-pro-pool sync；查看 sync.log")
+    check(time.time() - sync_state.get("at", 0) < 660, "配置同步正常（11 分钟内成功过）", "运行 claude-pro-pool sync；查看 sync.log")
     check(not sync_state.get("warnings"), "记忆无同步冲突", "查看 sync.log，合并 memory-CONFLICT 后运行 sync")
     try:
         data = account_data()
@@ -475,7 +475,9 @@ def doctor():
             if not usage_ok or not login_ok:
                 issues += 1
                 print(f"     → claude-pro-pool reauth {a['number']}；条款问题需本人在 claude.ai 同意")
-        check(bool(d["rank"](rows)), "有可自动派单账号", "增加其余账号；额度不足请等待重置，停用号可 enable")
+        dispatchable = bool(d["rank"](rows))
+        check(dispatchable, "有可自动派单的账号" if dispatchable else "暂时没有可自动派单的账号",
+              "增加其余账号；额度不足请等待重置，停用号可 enable")
     except (OSError, ValueError, subprocess.SubprocessError, SystemExit) as exc:
         check(False, "无法读取号池（未假装额度正常）", f"运行 dispatch-claude accounts；错误类型 {type(exc).__name__}")
     print(f"doctor: {issues} 项需处理" if issues else "doctor: 正常")
