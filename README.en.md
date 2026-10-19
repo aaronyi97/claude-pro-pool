@@ -14,7 +14,7 @@ claude-pro-pool add-account
 claude-pro-pool doctor
 ```
 
-Log into your usual main account first with `claude auth login` if needed. The second command opens the official browser login for another account and asks you to verify the identity. Repeat for further accounts. A direct installer is available after publication:
+Log into your usual main account first with `claude auth login` if needed. The second command opens the official browser login for another account and asks you to verify the identity. Repeat for further accounts. Or install with one line:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aaronyi97/claude-pro-pool/main/install.sh | bash

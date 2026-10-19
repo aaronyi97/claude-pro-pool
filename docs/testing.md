@@ -19,7 +19,7 @@ CPP_REAL_INSTALL=1 python3 -B -m unittest discover -s tests -p test_install.py -
 
 网络测试起始 PATH 中没有 uv 和 claude-swap，使用 README 的 `bash ./install.sh`；官方依赖真正下载，但登录、额度、模型调用和 launchctl 始终使用替身。安装后用包元数据验证 `0.26.0`，并执行薄适配的 `--version`；不触发上游账号或凭据操作。
 
-管道安装使用本地仓库打包的归档作为下载替身，检验 `bash` 从标准输入执行时的下载、解包和安装流程。公开 GitHub 的 curl 地址需仓库发布后才能直接验证，不把尚未发布的地址说成已上线。
+管道安装使用本地仓库打包的归档作为下载替身，检验 `bash` 从标准输入执行时的下载、解包和安装流程。仓库公开后，已在全新 HOME 中用 README 的 curl 一行命令实际安装、体检并卸载成功（2026-10-19）。
 
 ## 覆盖范围
 

@@ -28,7 +28,7 @@ bash ./install.sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-或者直接安装（仓库发布后可用）：
+或者一行命令直接安装：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aaronyi97/claude-pro-pool/main/install.sh | bash
