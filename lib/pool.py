@@ -447,7 +447,8 @@ def doctor():
     check(rule_text.count("claude-pro-pool:rules:BEGIN") == 1 and rule_text.count("claude-pro-pool:rules:END") == 1,
           "主对话规则块", "重新运行安装命令")
     check((CONFIG / "skills/claude-pro-pool/SKILL.md").is_file(), "派单 skill", "重新运行安装命令")
-    check(PLIST.exists() and service_loaded(), "同步服务已加载", "在 GUI 登录会话中运行 claude-pro-pool sync-service")
+    loaded = PLIST.exists() and service_loaded()
+    check(loaded, "同步服务已加载" if loaded else "同步服务未加载", "在 GUI 登录会话中运行 claude-pro-pool sync-service")
     sync_state = read_json(STATE / "sync-status.json", {})
     check(time.time() - sync_state.get("at", 0) < 660, "配置同步正常（11 分钟内成功过）", "运行 claude-pro-pool sync；查看 sync.log")
     check(not sync_state.get("warnings"), "记忆无同步冲突", "查看 sync.log，合并 memory-CONFLICT 后运行 sync")
